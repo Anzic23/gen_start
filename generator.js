@@ -60,6 +60,7 @@ var st = {
     starter_watchdog: null,
     starter_release: null,
     choke_close: null,
+    choke_close_manual: null,
     warmup: null,
     return_wait: null,
     stop_pulse: null,
@@ -108,6 +109,7 @@ function clearAllTimers() {
   clearTimer("starter_watchdog");
   clearTimer("starter_release");
   clearTimer("choke_close");
+  clearTimer("choke_close_manual");
   clearTimer("warmup");
   clearTimer("return_wait");
   clearTimer("stop_pulse");
@@ -123,7 +125,6 @@ function setK1(on, reason) {
     gLog("Состояние контактора К1 (посёлок): " + (on ? "включен" : "выключен") +
          (reason ? " (" + reason + ")" : ""));
   }
-  dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!dev[path];
 }
 
 function setK4(on, reason) {
@@ -133,8 +134,6 @@ function setK4(on, reason) {
     gLog("Состояние контактора К4 (генератор): " + (on ? "включен" : "выключен") +
          (reason ? " (" + reason + ")" : ""));
   }
-  dev[CFG.GEN_VDEV + "/manual_k4_gen"] = !!dev[path];
-  dev[CFG.GEN_VDEV + "/house_on_gen"] = !!dev[path];
 }
 
 function setChoke(open, reason) {
@@ -344,6 +343,7 @@ defineRule("gen_voltage_monitor", {
           stopStarter("генератор завёлся");
         }, CFG.START_RELEASE_DELAY_SEC * 1000);
         clearTimer("choke_close");
+        clearTimer("choke_close_manual");
         st.timers.choke_close = setTimeout(function () {
           setChoke(false, "закрываем заслонку после запуска");
         }, (CFG.START_RELEASE_DELAY_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
@@ -410,7 +410,17 @@ function startWarmupAndTransfer() {
   st.timers.warmup = setTimeout(function () {
     if (!st.generator_voltage) {
       gLog("Прогрев отменён: сигнал генератора пропал");
+      dev[CFG.GEN_VDEV + "/status"] = "Генератор заглох во время прогрева";
       st.autostart_in_progress = false;
+      if (st.attempts < CFG.START_ATTEMPTS_MAX && dev[CFG.GEN_VDEV + "/mode"] === "AUTO") {
+        clearTimer("start_retry");
+        st.timers.start_retry = setTimeout(function () {
+          if (!st.generator_voltage && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
+            st.autostart_in_progress = true;
+            handleStartFailure();
+          }
+        }, CFG.START_REST_SEC * 1000);
+      }
       return;
     }
     setK4(true, "дом на генераторе");
@@ -531,7 +541,8 @@ defineRule("manual_start", {
     setChoke(true, "ручной запуск");
     startStarter(false);
     clearTimer("choke_close");
-    st.timers.choke_close = setTimeout(function () {
+    clearTimer("choke_close_manual");
+    st.timers.choke_close_manual = setTimeout(function () {
       if (!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_active) {
         setChoke(false, "закрываем заслонку после ручной попытки");
       }
