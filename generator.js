@@ -187,7 +187,7 @@ function startStarter(allowRetry) {
     gLog("Стартер не включаем: реле глушения активно");
     return false;
   }
-  if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT]) {
+  if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_release_window) {
     gLog("Стартер не включаем: генератор уже даёт напряжение");
     return false;
   }
@@ -256,9 +256,12 @@ function updateGridState(fromInit) {
   var l1 = dev[CFG.GRID_METER_DEVICE + "/" + CFG.GRID_V_L1];
   var l2 = dev[CFG.GRID_METER_DEVICE + "/" + CFG.GRID_V_L2];
   var l3 = dev[CFG.GRID_METER_DEVICE + "/" + CFG.GRID_V_L3];
-  l1 = typeof l1 === "number" ? l1 : 0;
-  l2 = typeof l2 === "number" ? l2 : 0;
-  l3 = typeof l3 === "number" ? l3 : 0;
+  if (typeof l1 !== "number" || typeof l2 !== "number" || typeof l3 !== "number") {
+    if (!fromInit) {
+      gLog("⚠️ Данные счётчика недоступны");
+    }
+    return st.grid_ok;
+  }
 
   dev[CFG.GEN_VDEV + "/voltage_l1"] = l1;
   dev[CFG.GEN_VDEV + "/voltage_l2"] = l2;
@@ -472,6 +475,9 @@ defineRule("mode_change", {
     clearAllTimers();
     st.autostart_in_progress = false;
     st.return_in_progress = false;
+    if (mode === "AUTO" && dev[CFG.GEN_VDEV + "/house_on_gen"]) {
+      scheduleGridCheck();
+    }
   }
 });
 
