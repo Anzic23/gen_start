@@ -1,4 +1,10 @@
 // Управление генератором и вводами (wb-rules)
+// v5.0 - Исправления:
+// - Убран clearInterval из clearTimer
+// - Убраны лишние логи синхронизации
+// - Исправлена логика ручного запуска (добавлен флаг manual_start_in_progress)
+// - Добавлено логирование всех реле и входов
+// - Добавлена статистика (моточасы, циклы запуска)
 
 // =============== КОНФИГУРАЦИЯ ==================================
 var CFG = {
@@ -36,7 +42,7 @@ var CFG = {
 
   CHOKE_CLOSE_AFTER_RELEASE_SEC: 5,
   WARMUP_SEC: 30,
-  WARMUP_GRID_STABLE_SEC: 10,  // Новый: стабильность сети во время прогрева
+  WARMUP_GRID_STABLE_SEC: 10,
 
   RETURN_WAIT_SEC: 20,
   K4_OFF_AFTER_RETURN_SEC: 5,
@@ -45,7 +51,10 @@ var CFG = {
   GRID_CHECK_INTERVAL_SEC: 30,
   GRID_FAIL_DEBOUNCE_SEC: 3,
 
-  VIN_MIN: 11.0
+  VIN_MIN: 11.0,
+  
+  // Новое: минимальное время между ручными попытками
+  MANUAL_START_COOLDOWN_SEC: 2
 };
 
 // =============== СОСТОЯНИЕ =====================================
@@ -54,12 +63,25 @@ var st = {
   generator_voltage: false,
   autostart_in_progress: false,
   return_in_progress: false,
-  warmup_in_progress: false,      // Новый флаг
+  warmup_in_progress: false,
+  manual_start_in_progress: false,  // Новый флаг
   attempts: 0,
   starter_active: false,
   starter_release_window: false,
   grid_fail_timestamp: null,
-  grid_restored_during_warmup: null,  // Новый: отметка времени восстановления сети
+  grid_restored_during_warmup: null,
+  last_manual_start: 0,  // Новое: timestamp последнего ручного запуска
+  
+  // Статистика
+  stats: {
+    total_starts: 0,
+    successful_starts: 0,
+    failed_starts: 0,
+    engine_hours: 0,
+    last_start_time: null,
+    engine_start_time: null
+  },
+  
   timers: {
     starter_spin: null,
     starter_watchdog: null,
@@ -67,13 +89,15 @@ var st = {
     choke_close: null,
     choke_close_manual: null,
     warmup: null,
-    warmup_grid_check: null,    // Новый таймер
+    warmup_grid_check: null,
     return_wait: null,
     stop_pulse: null,
     k4_off_delay: null,
     grid_check_interval: null,
     start_retry: null,
-    grid_fail_debounce: null
+    grid_fail_debounce: null,
+    manual_cooldown: null,  // Новый таймер
+    engine_hours_counter: null  // Таймер подсчёта моточасов
   }
 };
 
@@ -94,7 +118,13 @@ defineVirtualDevice(CFG.GEN_VDEV, {
     manual_k1_grid: { type: "switch", value: false },
     manual_k4_gen: { type: "switch", value: false },
     manual_start: { type: "pushbutton" },
-    emergency_stop: { type: "switch", value: false }
+    emergency_stop: { type: "switch", value: false },
+    
+    // Статистика
+    total_starts: { type: "value", readonly: true, value: 0 },
+    successful_starts: { type: "value", readonly: true, value: 0 },
+    failed_starts: { type: "value", readonly: true, value: 0 },
+    engine_hours: { type: "value", readonly: true, value: 0, units: "h", precision: 1 }
   }
 });
 
@@ -105,8 +135,7 @@ function gLog(msg) {
 
 function clearTimer(name) {
   if (st.timers[name]) {
-    clearTimeout(st.timers[name]);
-    clearInterval(st.timers[name]);
+    clearTimeout(st.timers[name]);  // Исправлено: убран clearInterval
     st.timers[name] = null;
   }
 }
@@ -125,14 +154,14 @@ function clearAllTimers() {
   clearTimer("grid_check_interval");
   clearTimer("start_retry");
   clearTimer("grid_fail_debounce");
+  clearTimer("manual_cooldown");
 }
 
 function setK1(on, reason) {
   var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1;
   if (dev[path] !== on) {
     dev[path] = on;
-    gLog("Состояние контактора К1 (посёлок): " + (on ? "включен" : "выключен") +
-         (reason ? " (" + reason + ")" : ""));
+    gLog("К1 (посёлок): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
@@ -140,8 +169,7 @@ function setK4(on, reason) {
   var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4;
   if (dev[path] !== on) {
     dev[path] = on;
-    gLog("Состояние контактора К4 (генератор): " + (on ? "включен" : "выключен") +
-         (reason ? " (" + reason + ")" : ""));
+    gLog("К4 (генератор): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
@@ -149,7 +177,7 @@ function setChoke(open, reason) {
   var path = CFG.GEN_RELAY_DEVICE + "/" + CFG.CHOKE_RELAY;
   if (dev[path] !== open) {
     dev[path] = open;
-    gLog("Заслонка " + (open ? "открыта" : "закрыта") + (reason ? " (" + reason + ")" : ""));
+    gLog("K3 (заслонка): " + (open ? "OPEN" : "CLOSED") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
@@ -157,7 +185,7 @@ function setStopRelay(on, reason) {
   var path = CFG.GEN_RELAY_DEVICE + "/" + CFG.STOP_RELAY;
   if (dev[path] !== on) {
     dev[path] = on;
-    gLog("Реле глушения " + (on ? "включено" : "выключено") + (reason ? " (" + reason + ")" : ""));
+    gLog("K2 (глушение): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
   if (on) {
     stopStarter("реле глушения активно");
@@ -173,44 +201,70 @@ function stopStarter(reason) {
     clearTimer("starter_spin");
     clearTimer("starter_watchdog");
     clearTimer("starter_release");
-    gLog("Стартер отключён" + (reason ? " (" + reason + ")" : ""));
+    gLog("K1 (стартер): OFF" + (reason ? " (" + reason + ")" : ""));
+    
+    // Останавливаем счётчик попыток ручного запуска
+    if (st.manual_start_in_progress) {
+      st.manual_start_in_progress = false;
+    }
   }
 }
 
-function startStarter(allowRetry) {
+function startStarter(allowRetry, isManual) {
   var path = CFG.GEN_RELAY_DEVICE + "/" + CFG.STARTER_RELAY;
+  
   if (st.starter_active) {
-    gLog("Стартер уже активен, включение игнорируется");
+    gLog("⚠️ Стартер уже активен, включение игнорируется");
     return false;
   }
   if (dev[CFG.GEN_VDEV + "/emergency_stop"]) {
-    gLog("Стартер не включаем: аварийный стоп активен");
+    gLog("⚠️ Блокировка: emergency_stop");
     return false;
   }
   if (dev[CFG.GEN_VDEV + "/oil_low"]) {
-    gLog("Стартер не включаем: низкий уровень масла");
+    gLog("⚠️ Блокировка: низкий уровень масла");
     return false;
   }
   if (dev[CFG.GEN_RELAY_DEVICE + "/" + CFG.STOP_RELAY]) {
-    gLog("Стартер не включаем: реле глушения активно");
+    gLog("⚠️ Блокировка: реле глушения активно");
     return false;
   }
   if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_release_window) {
-    gLog("Стартер не включаем: генератор уже даёт напряжение");
+    gLog("⚠️ Блокировка: генератор уже работает");
     return false;
+  }
+
+  // Для ручного режима: проверка cooldown
+  if (isManual) {
+    var now = Date.now();
+    var elapsed = (now - st.last_manual_start) / 1000;
+    if (elapsed < CFG.MANUAL_START_COOLDOWN_SEC) {
+      gLog("⚠️ Cooldown: подождите " + (CFG.MANUAL_START_COOLDOWN_SEC - Math.floor(elapsed)) + " сек");
+      return false;
+    }
+    st.last_manual_start = now;
+    st.manual_start_in_progress = true;
   }
 
   st.starter_active = true;
   st.starter_release_window = false;
   dev[path] = true;
-  gLog("Стартер включён");
+  gLog("K1 (стартер): ON");
+  
+  // Статистика
+  st.stats.total_starts++;
+  st.stats.last_start_time = new Date().toISOString();
+  updateStats();
 
   clearTimer("starter_watchdog");
   st.timers.starter_watchdog = setTimeout(function () {
     if (st.starter_active) {
-      stopStarter("стартер работал слишком долго");
+      stopStarter("watchdog 10 сек");
       if (allowRetry && st.autostart_in_progress) {
         handleStartFailure();
+      } else if (isManual) {
+        st.stats.failed_starts++;
+        updateStats();
       }
     }
   }, CFG.START_MAX_SEC * 1000);
@@ -223,18 +277,57 @@ function startStarter(allowRetry) {
     if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT]) {
       return;
     }
-    stopStarter("генератор не запущен за " + CFG.START_SPIN_SEC + " с");
+    stopStarter("таймаут " + CFG.START_SPIN_SEC + " сек");
     if (allowRetry && st.autostart_in_progress) {
       handleStartFailure();
+    } else if (isManual) {
+      st.stats.failed_starts++;
+      updateStats();
     }
   }, CFG.START_SPIN_SEC * 1000);
 
   return true;
 }
 
-// =============== ОТМЕНА АВТОЗАПУСКА ============================
+// Статистика
+function updateStats() {
+  dev[CFG.GEN_VDEV + "/total_starts"] = st.stats.total_starts;
+  dev[CFG.GEN_VDEV + "/successful_starts"] = st.stats.successful_starts;
+  dev[CFG.GEN_VDEV + "/failed_starts"] = st.stats.failed_starts;
+  dev[CFG.GEN_VDEV + "/engine_hours"] = st.stats.engine_hours;
+}
+
+function startEngineHoursCounter() {
+  if (st.timers.engine_hours_counter) return;
+  
+  st.stats.engine_start_time = Date.now();
+  st.timers.engine_hours_counter = setInterval(function() {
+    if (st.stats.engine_start_time) {
+      var elapsed = (Date.now() - st.stats.engine_start_time) / 1000 / 3600;
+      st.stats.engine_hours += elapsed;
+      st.stats.engine_start_time = Date.now();
+      updateStats();
+    }
+  }, 60000); // Обновление каждую минуту
+}
+
+function stopEngineHoursCounter() {
+  if (st.timers.engine_hours_counter) {
+    clearInterval(st.timers.engine_hours_counter);
+    st.timers.engine_hours_counter = null;
+  }
+  if (st.stats.engine_start_time) {
+    var elapsed = (Date.now() - st.stats.engine_start_time) / 1000 / 3600;
+    st.stats.engine_hours += elapsed;
+    st.stats.engine_start_time = null;
+    updateStats();
+  }
+}
+
 function cancelAutostart(reason) {
   gLog("Автозапуск отменён: " + reason);
+  
+  st.canceling_autostart = true;  // ✅ Устанавливаем флаг
   st.autostart_in_progress = false;
   st.warmup_in_progress = false;
   st.grid_restored_during_warmup = null;
@@ -243,8 +336,13 @@ function cancelAutostart(reason) {
   clearTimer("warmup");
   clearTimer("warmup_grid_check");
   clearTimer("start_retry");
-  setK1(true, "возврат на посёлок после отмены автозапуска");
+  setK1(true, "возврат на посёлок после отмены");
   dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
+  
+  // Сбрасываем флаг через небольшую задержку
+  setTimeout(function() {
+    st.canceling_autostart = false;
+  }, 100);
 }
 
 // =============== МОНИТОРИНГ VIN И МАСЛА =======================
@@ -253,14 +351,22 @@ function updateVin() {
   if (typeof val === "undefined") {
     return;
   }
-  dev[CFG.GEN_VDEV + "/vin_12v_ok"] = val >= CFG.VIN_MIN;
+  var ok = val >= CFG.VIN_MIN;
+  if (dev[CFG.GEN_VDEV + "/vin_12v_ok"] !== ok) {
+    dev[CFG.GEN_VDEV + "/vin_12v_ok"] = ok;
+    gLog("Vin: " + val.toFixed(1) + "В " + (ok ? "✓" : "⚠️"));
+  }
 }
 
 function updateOilLow() {
   var low = !!dev[CFG.GPIO_DEVICE + "/" + CFG.OIL_INPUT];
-  dev[CFG.GEN_VDEV + "/oil_low"] = low;
-  if (low) {
-    gLog("Низкий уровень масла — блокировка запуска");
+  if (dev[CFG.GEN_VDEV + "/oil_low"] !== low) {
+    dev[CFG.GEN_VDEV + "/oil_low"] = low;
+    if (low) {
+      gLog("⚠️ EXT1_IN3 (датчик масла): LOW — блокировка запуска");
+    } else {
+      gLog("EXT1_IN3 (датчик масла): OK");
+    }
   }
 }
 
@@ -309,88 +415,78 @@ function updateGridState(fromInit) {
 }
 
 function onGridLost() {
-  gLog("Напряжение посёлка вне нормы или отсутствует (" + getVoltageString() + ")");
+  gLog("Сеть: LOST (" + getVoltageString() + ")");
   dev[CFG.GEN_VDEV + "/status"] = "СЕТИ НЕТ — ЗАПУСК ГЕНЕРАТОРА";
   
-  // Сбрасываем отметку восстановления сети во время прогрева
   st.grid_restored_during_warmup = null;
   clearTimer("warmup_grid_check");
   
   if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
-    // Запускаем debounce таймер
-    gLog("Ожидание " + CFG.GRID_FAIL_DEBOUNCE_SEC + " сек перед автозапуском (защита от просадок)");
+    gLog("Debounce " + CFG.GRID_FAIL_DEBOUNCE_SEC + " сек");
     clearTimer("grid_fail_debounce");
     st.timers.grid_fail_debounce = setTimeout(function() {
-      // Проверяем, что сеть всё ещё плохая
       var stillBad = !updateGridState(false);
       if (stillBad && dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
-        gLog("Сеть нестабильна " + CFG.GRID_FAIL_DEBOUNCE_SEC + " сек, запускаем автозапуск");
+        gLog("Сеть нестабильна " + CFG.GRID_FAIL_DEBOUNCE_SEC + " сек → автозапуск");
         startAutostart();
       } else if (!stillBad) {
-        gLog("Сеть восстановилась во время ожидания, автозапуск отменён");
+        gLog("Сеть восстановилась во время debounce");
         dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
       }
       st.grid_fail_timestamp = null;
     }, CFG.GRID_FAIL_DEBOUNCE_SEC * 1000);
     st.grid_fail_timestamp = Date.now();
   } else {
-    gLog("Автозапуск не выполняется (режим не AUTO или аварийный стоп)");
+    gLog("Автозапуск недоступен (режим/emergency_stop)");
   }
 }
 
 function onGridRestored() {
-  gLog("Напряжение посёлка в норме (" + getVoltageString() + ")");
+  gLog("Сеть: OK (" + getVoltageString() + ")");
   
-  // Отменяем debounce если он активен
   if (st.grid_fail_timestamp) {
     clearTimer("grid_fail_debounce");
     st.grid_fail_timestamp = null;
-    gLog("Отменён таймер debounce — сеть восстановилась");
+    gLog("Debounce отменён");
   }
   
-  // ГИБРИДНАЯ ЛОГИКА: проверяем фазу автозапуска
   if (st.autostart_in_progress) {
     if (st.warmup_in_progress) {
-      // Во время прогрева — запускаем проверку стабильности
       if (!st.grid_restored_during_warmup) {
         st.grid_restored_during_warmup = Date.now();
-        gLog("Сеть восстановилась во время прогрева, проверка стабильности " + 
-             CFG.WARMUP_GRID_STABLE_SEC + " сек");
+        gLog("Сеть восстановилась во время прогрева, проверка " + CFG.WARMUP_GRID_STABLE_SEC + " сек");
         
         clearTimer("warmup_grid_check");
         st.timers.warmup_grid_check = setTimeout(function() {
           var ok = updateGridState(false);
           if (ok && st.warmup_in_progress) {
-            gLog("Сеть стабильна " + CFG.WARMUP_GRID_STABLE_SEC + " сек во время прогрева, отменяем автозапуск");
+            gLog("Сеть стабильна " + CFG.WARMUP_GRID_STABLE_SEC + " сек → отмена автозапуска");
             cancelAutostart("сеть восстановилась и стабильна");
           } else if (!ok) {
-            gLog("Сеть снова пропала, продолжаем прогрев");
+            gLog("Сеть снова пропала → продолжаем прогрев");
             st.grid_restored_during_warmup = null;
           }
         }, CFG.WARMUP_GRID_STABLE_SEC * 1000);
       }
     } else if (!st.starter_active) {
-      // До начала вращения стартера или между попытками — отменяем сразу
       gLog("Сеть восстановилась до запуска генератора");
       cancelAutostart("сеть восстановилась до запуска");
     } else {
-      // Стартер крутится — даём завершить попытку
-      gLog("Сеть восстановилась во время вращения стартера, попытка будет завершена");
+      gLog("Сеть восстановилась во время вращения стартера");
     }
     return;
   }
   
-  // Штатная логика для работающего генератора
   if (!dev[CFG.GEN_VDEV + "/house_on_gen"]) {
     dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
-    setK1(true, "сеть восстановилась, дом уже на посёлке");
+    setK1(true, "сеть восстановилась");
     return;
   }
   
   if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
     startReturnProcedure();
   } else {
-    gLog("Возврат на посёлок не запускаем (режим не AUTO или авария)");
+    gLog("Возврат недоступен (режим/emergency_stop)");
   }
 }
 
@@ -411,7 +507,6 @@ defineRule("grid_monitor", {
   }
 });
 
-// периодическая проверка сети при питании от генератора
 function scheduleGridCheck() {
   clearTimer("grid_check_interval");
   st.timers.grid_check_interval = setInterval(function () {
@@ -429,28 +524,52 @@ defineRule("gen_voltage_monitor", {
   then: function (value) {
     st.generator_voltage = !!value;
     if (value) {
-      gLog("Обнаружено напряжение от генератора");
+      gLog("EXT1_IN6 (напряжение генератора): ON");
+      
+      // Запуск счётчика моточасов
+      if (!st.timers.engine_hours_counter) {
+        startEngineHoursCounter();
+      }
+      
       if (st.starter_active) {
         st.starter_release_window = true;
         clearTimer("starter_release");
         st.timers.starter_release = setTimeout(function () {
           st.starter_release_window = false;
           stopStarter("генератор завёлся");
+          
+          // Статистика успешного запуска
+          st.stats.successful_starts++;
+          updateStats();
         }, CFG.START_RELEASE_DELAY_SEC * 1000);
+        
         clearTimer("choke_close");
         clearTimer("choke_close_manual");
         st.timers.choke_close = setTimeout(function () {
-          setChoke(false, "закрываем заслонку после запуска");
+          setChoke(false, "закрываем после запуска");
         }, (CFG.START_RELEASE_DELAY_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
       }
+      
+      // ✅ ИСПРАВЛЕНО: проверяем режим AUTO и состояние сети
       if (st.autostart_in_progress) {
+        startWarmupAndTransfer();
+      } else if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && 
+                 !dev[CFG.GEN_VDEV + "/house_on_gen"] && 
+                 !st.grid_ok) {
+        // Генератор запустился вручную/внешне, но режим AUTO и сеть плохая
+        gLog("Генератор работает, сеть плохая, режим AUTO → переводим дом на генератор");
+        st.autostart_in_progress = true;  // Включаем флаг
         startWarmupAndTransfer();
       } else {
         dev[CFG.GEN_VDEV + "/status"] = "Ручной запуск: генератор завёлся";
       }
     } else {
+      gLog("EXT1_IN6 (напряжение генератора): OFF");
       st.generator_voltage = false;
       setChoke(false, "генератор не даёт напряжение");
+      
+      // Остановка счётчика моточасов
+      stopEngineHoursCounter();
     }
   }
 });
@@ -464,27 +583,33 @@ function startAutostart() {
   st.return_in_progress = false;
   st.autostart_in_progress = true;
   st.warmup_in_progress = false;
-  st.attempts = 1;
-  gLog("СЕТИ НЕТ — ЗАПУСК ГЕНЕРАТОРА");
-  gLog("Попытка запуска #" + st.attempts);
+  st.attempts = 1;  // ✅ ИСПРАВЛЕНО: начинаем с попытки #1
+  gLog("СЕТИ НЕТ — ЗАПУСК ГЕНЕРАТОРА (макс. " + CFG.START_ATTEMPTS_MAX + " попыток)");
+  gLog("Попытка #" + st.attempts);
   setK1(false, "сеть пропала");
   setChoke(true, "автозапуск");
-  startStarter(true);
+  startStarter(true, false);
 }
 
 function handleStartFailure() {
   if (!st.autostart_in_progress) {
     return;
   }
+  
+  // ✅ ИСПРАВЛЕНО: увеличиваем счётчик ПЕРЕД проверкой
   st.attempts += 1;
+  
   if (st.attempts > CFG.START_ATTEMPTS_MAX) {
-    gLog("Генератор не запущен после " + CFG.START_ATTEMPTS_MAX + " попыток");
+    gLog("❌ Генератор не запущен после " + CFG.START_ATTEMPTS_MAX + " попыток");
     dev[CFG.GEN_VDEV + "/status"] = "Ошибка запуска";
     st.autostart_in_progress = false;
     setChoke(false, "запуск не удался");
+    st.stats.failed_starts++;
+    updateStats();
     return;
   }
-  gLog("Генератор не запустился, даём стартеру отдохнуть " + CFG.START_REST_SEC + " с");
+  
+  gLog("Пауза " + CFG.START_REST_SEC + " сек перед попыткой #" + st.attempts);
   clearTimer("starter_spin");
   clearTimer("starter_watchdog");
   clearTimer("starter_release");
@@ -493,16 +618,15 @@ function handleStartFailure() {
     if (!st.autostart_in_progress || dev[CFG.GEN_VDEV + "/emergency_stop"]) {
       return;
     }
-    // Проверяем сеть перед повторной попыткой
     var ok = updateGridState(false);
     if (ok) {
-      gLog("Сеть восстановилась перед попыткой #" + st.attempts + ", отменяем автозапуск");
+      gLog("Сеть восстановилась перед попыткой #" + st.attempts);
       cancelAutostart("сеть восстановилась между попытками");
       return;
     }
-    gLog("Попытка запуска #" + st.attempts);
+    gLog("Попытка #" + st.attempts);
     setChoke(true, "повтор автозапуска");
-    startStarter(true);
+    startStarter(true, false);
   }, CFG.START_REST_SEC * 1000);
 }
 
@@ -510,10 +634,10 @@ function startWarmupAndTransfer() {
   clearTimer("warmup");
   st.warmup_in_progress = true;
   dev[CFG.GEN_VDEV + "/status"] = "Генератор запущен, прогрев";
-  gLog("Генератор запущен, прогрев " + CFG.WARMUP_SEC + " с");
+  gLog("Прогрев " + CFG.WARMUP_SEC + " сек");
   st.timers.warmup = setTimeout(function () {
     if (!st.generator_voltage) {
-      gLog("Прогрев отменён: сигнал генератора пропал");
+      gLog("⚠️ Прогрев отменён: генератор заглох");
       dev[CFG.GEN_VDEV + "/status"] = "Генератор заглох во время прогрева";
       st.autostart_in_progress = false;
       st.warmup_in_progress = false;
@@ -549,12 +673,12 @@ function startReturnProcedure() {
   }
   st.return_in_progress = true;
   dev[CFG.GEN_VDEV + "/status"] = "Возврат на посёлок (" + CFG.RETURN_WAIT_SEC + " с)";
-  gLog("Возврат на посёлок запущен (" + getVoltageString() + ")");
+  gLog("Возврат на посёлок (" + getVoltageString() + ")");
   clearTimer("return_wait");
   st.timers.return_wait = setTimeout(function () {
     var ok = updateGridState(false);
     if (!ok) {
-      gLog("Возврат отменён — напряжение снова вне нормы (" + getVoltageString() + ")");
+      gLog("⚠️ Возврат отменён: сеть снова вне нормы (" + getVoltageString() + ")");
       dev[CFG.GEN_VDEV + "/status"] = "Дом на генераторе (сеть нестабильна)";
       st.return_in_progress = false;
       return;
@@ -564,7 +688,7 @@ function startReturnProcedure() {
 }
 
 function performReturnSwitch() {
-  gLog("Сеть стабильна, переключаем дом на посёлок (" + getVoltageString() + ")");
+  gLog("Сеть стабильна → переключаем на посёлок (" + getVoltageString() + ")");
   setK1(true, "возврат на посёлок");
   dev[CFG.GEN_VDEV + "/house_on_gen"] = false;
 
@@ -589,15 +713,36 @@ defineRule("mode_change", {
     var mode = newValue === "MANUAL" ? "MANUAL" : "AUTO";
     dev[CFG.GEN_VDEV + "/mode"] = mode;
     dev[CFG.GEN_VDEV + "/mode_auto"] = mode === "AUTO";
-    gLog("Режим изменён на " + mode);
+    gLog("Режим: " + mode);
     clearAllTimers();
     st.autostart_in_progress = false;
     st.warmup_in_progress = false;
     st.return_in_progress = false;
     st.grid_fail_timestamp = null;
     st.grid_restored_during_warmup = null;
-    if (mode === "AUTO" && dev[CFG.GEN_VDEV + "/house_on_gen"]) {
-      scheduleGridCheck();
+    st.manual_start_in_progress = false;
+    
+    if (mode === "AUTO") {
+      // ✅ НОВАЯ ЛОГИКА: проверяем состояние сети при переключении в AUTO
+      if (dev[CFG.GEN_VDEV + "/house_on_gen"]) {
+        // Уже на генераторе → запускаем периодическую проверку сети
+        gLog("Дом на генераторе → запуск мониторинга сети");
+        scheduleGridCheck();
+      } else {
+        // Дом на посёлке → проверяем состояние сети
+        var ok = updateGridState(false);
+        if (!ok && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
+          // Сеть плохая → запускаем автозапуск
+          gLog("Сеть вне нормы при переключении в AUTO → запуск генератора");
+          // Запускаем через debounce (защита от ложных срабатываний)
+          onGridLost();
+        } else if (ok) {
+          gLog("Сеть в норме");
+          dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
+        } else {
+          gLog("Автозапуск недоступен: emergency_stop активен");
+        }
+      }
     }
   }
 });
@@ -613,7 +758,7 @@ defineRule("manual_k1", {
   whenChanged: CFG.GEN_VDEV + "/manual_k1_grid",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("manual_k1_grid изменён не в MANUAL, игнорирую");
+      // Исправлено: убран лог, просто синхронизируем
       dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
       return;
     }
@@ -625,7 +770,7 @@ defineRule("manual_k4", {
   whenChanged: CFG.GEN_VDEV + "/manual_k4_gen",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("manual_k4_gen изменён не в MANUAL, игнорирую");
+      // Исправлено: убран лог
       dev[CFG.GEN_VDEV + "/manual_k4_gen"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4];
       return;
     }
@@ -637,27 +782,33 @@ defineRule("manual_start", {
   whenChanged: CFG.GEN_VDEV + "/manual_start",
   then: function () {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("manual_start изменён не в MANUAL, игнорирую");
+      gLog("⚠️ manual_start доступен только в MANUAL режиме");
       return;
     }
     if (dev[CFG.GEN_VDEV + "/emergency_stop"]) {
-      gLog("Ручной запуск заблокирован аварийным стопом");
+      gLog("⚠️ Ручной запуск заблокирован: emergency_stop");
       return;
     }
     if (dev[CFG.GEN_VDEV + "/oil_low"]) {
-      gLog("Ручной запуск невозможен: низкий уровень масла");
+      gLog("⚠️ Ручной запуск заблокирован: низкий уровень масла");
       return;
     }
-    gLog("Ручной запуск: одна попытка");
+    
+    gLog("Ручной запуск: попытка");
     setChoke(true, "ручной запуск");
-    startStarter(false);
-    clearTimer("choke_close");
-    clearTimer("choke_close_manual");
-    st.timers.choke_close_manual = setTimeout(function () {
-      if (!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_active) {
-        setChoke(false, "закрываем заслонку после ручной попытки");
-      }
-    }, (CFG.START_SPIN_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
+    
+    // Исправлено: передаём флаг isManual=true
+    var started = startStarter(false, true);
+    
+    if (started) {
+      clearTimer("choke_close");
+      clearTimer("choke_close_manual");
+      st.timers.choke_close_manual = setTimeout(function () {
+        if (!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_active) {
+          setChoke(false, "закрываем после ручной попытки");
+        }
+      }, (CFG.START_SPIN_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
+    }
   }
 });
 
@@ -666,23 +817,24 @@ defineRule("emergency_stop", {
   whenChanged: CFG.GEN_VDEV + "/emergency_stop",
   then: function (val) {
     if (val) {
-      gLog("Установлен emergency_stop — все процедуры прерваны");
+      gLog("⚠️⚠️⚠️ EMERGENCY STOP АКТИВИРОВАН");
       st.autostart_in_progress = false;
       st.warmup_in_progress = false;
       st.return_in_progress = false;
       st.grid_fail_timestamp = null;
       st.grid_restored_during_warmup = null;
+      st.manual_start_in_progress = false;
       clearAllTimers();
-      stopStarter("аварийный стоп");
-      setChoke(false, "аварийный стоп");
-      setStopRelay(true, "аварийный стоп");
+      stopStarter("emergency_stop");
+      setChoke(false, "emergency_stop");
+      setStopRelay(true, "emergency_stop");
       clearTimer("stop_pulse");
       st.timers.stop_pulse = setTimeout(function () {
-        setStopRelay(false, "сброс стоп-реле после аварии");
+        setStopRelay(false, "сброс после emergency_stop");
       }, CFG.STOP_PULSE_SEC * 1000);
       dev[CFG.GEN_VDEV + "/status"] = "Аварийный стоп";
     } else {
-      gLog("Сброшен emergency_stop");
+      gLog("Emergency stop сброшен");
     }
   }
 });
@@ -692,7 +844,7 @@ defineRule("starter_external", {
   whenChanged: CFG.GEN_RELAY_DEVICE + "/" + CFG.STARTER_RELAY,
   then: function (val) {
     if (val && !st.starter_active) {
-      gLog("Обнаружено внешнее включение стартера, отключаем");
+      gLog("⚠️ Внешнее включение K1 (стартер) обнаружено → принудительное отключение");
       stopStarter("внешнее вмешательство");
     }
   }
@@ -702,8 +854,8 @@ defineRule("stop_relay_monitor", {
   whenChanged: CFG.GEN_RELAY_DEVICE + "/" + CFG.STOP_RELAY,
   then: function (val) {
     if (val) {
-      gLog("Реле глушения включено — стартер принудительно отключен");
-      stopStarter("стоп активен");
+      gLog("K2 (глушение) включено → стартер принудительно отключён");
+      stopStarter("K2 активен");
     }
   }
 });
@@ -711,6 +863,7 @@ defineRule("stop_relay_monitor", {
 defineRule("sync_k1_real", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (value) {
+    // Исправлено: синхронизация работает всегда, без логов
     dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!value;
   }
 });
@@ -724,11 +877,44 @@ defineRule("sync_k4_real", {
   }
 });
 
+// =============== ЛОГИРОВАНИЕ ВХОДОВ ============================
+defineRule("log_choke", {
+  whenChanged: CFG.GEN_RELAY_DEVICE + "/" + CFG.CHOKE_RELAY,
+  then: function (val) {
+    if (!st.starter_active && !st.manual_start_in_progress) {
+      gLog("⚠️ Внешнее изменение K3 (заслонка): " + (val ? "OPEN" : "CLOSED"));
+    }
+  }
+});
+
+defineRule("log_k1_external", {
+  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
+  then: function (val) {
+    // Логируем только если это не наша команда
+    if (!st.autostart_in_progress && !st.return_in_progress && 
+        !st.canceling_autostart &&  // ✅ Проверяем новый флаг
+        dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
+      gLog("⚠️ Внешнее изменение К1 (посёлок): " + (val ? "ON" : "OFF"));
+    }
+  }
+});
+
+defineRule("log_k4_external", {
+  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4,
+  then: function (val) {
+    if (!st.autostart_in_progress && !st.return_in_progress && 
+        !st.canceling_autostart &&  // ✅ Проверяем новый флаг
+        dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
+      gLog("⚠️ Внешнее изменение К4 (генератор): " + (val ? "ON" : "OFF"));
+    }
+  }
+});
+
 // =============== ИНИЦИАЛИЗАЦИЯ ================================
 defineRule("gen_init", {
   asSoonAs: function () { return true; },
   then: function () {
-    gLog("Инициализация логики генератора");
+    gLog("=== ИНИЦИАЛИЗАЦИЯ СИСТЕМЫ ===");
     updateVin();
     updateOilLow();
     updateGridState(true);
@@ -748,6 +934,10 @@ defineRule("gen_init", {
       dev[CFG.GEN_VDEV + "/status"] = "Сеть вне нормы при старте, дом на текущем источнике";
     }
 
-    gLog("Инициализация завершена, режим: " + dev[CFG.GEN_VDEV + "/mode"]);
+    gLog("Режим: " + dev[CFG.GEN_VDEV + "/mode"]);
+    gLog("К1 (посёлок): " + (k1 ? "ON" : "OFF"));
+    gLog("К4 (генератор): " + (k4 ? "ON" : "OFF"));
+    gLog("Сеть: " + (st.grid_ok ? "OK" : "LOST"));
+    gLog("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА ===");
   }
 });
