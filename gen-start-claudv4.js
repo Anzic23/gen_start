@@ -1,10 +1,10 @@
 // Управление генератором и вводами (wb-rules)
-// v5.0 - Исправления:
-// - Убран clearInterval из clearTimer
-// - Убраны лишние логи синхронизации
-// - Исправлена логика ручного запуска (добавлен флаг manual_start_in_progress)
-// - Добавлено логирование всех реле и входов
-// - Добавлена статистика (моточасы, циклы запуска)
+// v5.1 - Исправления заслонки:
+// - Добавлен периодический мониторинг заслонки каждые 10 сек
+// - Исправлен баг с условием закрытия заслонки в ручном режиме
+// - Гарантированное закрытие через макс. 10 сек после запуска
+// - Отслеживание времени открытия заслонки
+// - Принудительное закрытие если генератор работает
 
 // =============== КОНФИГУРАЦИЯ ==================================
 var CFG = {
@@ -53,8 +53,11 @@ var CFG = {
 
   VIN_MIN: 11.0,
   
-  // Новое: минимальное время между ручными попытками
-  MANUAL_START_COOLDOWN_SEC: 2
+  MANUAL_START_COOLDOWN_SEC: 2,
+  
+  // Контроль заслонки
+  CHOKE_CHECK_INTERVAL_SEC: 10,  // Проверка каждые 10 сек
+  CHOKE_MAX_OPEN_TIME_SEC: 10    // Макс. 10 сек открытия после запуска
 };
 
 // =============== СОСТОЯНИЕ =====================================
@@ -64,13 +67,16 @@ var st = {
   autostart_in_progress: false,
   return_in_progress: false,
   warmup_in_progress: false,
-  manual_start_in_progress: false,  // Новый флаг
+  manual_start_in_progress: false,
   attempts: 0,
   starter_active: false,
   starter_release_window: false,
   grid_fail_timestamp: null,
   grid_restored_during_warmup: null,
-  last_manual_start: 0,  // Новое: timestamp последнего ручного запуска
+  last_manual_start: 0,
+  choke_opened_at: null,  // Timestamp открытия заслонки
+  choke_should_be_closed: false,  // Флаг для принудительного контроля
+  canceling_autostart: false,
   
   // Статистика
   stats: {
@@ -96,8 +102,9 @@ var st = {
     grid_check_interval: null,
     start_retry: null,
     grid_fail_debounce: null,
-    manual_cooldown: null,  // Новый таймер
-    engine_hours_counter: null  // Таймер подсчёта моточасов
+    manual_cooldown: null,
+    engine_hours_counter: null,
+    choke_monitor: null  // Периодическая проверка заслонки
   }
 };
 
@@ -135,7 +142,7 @@ function gLog(msg) {
 
 function clearTimer(name) {
   if (st.timers[name]) {
-    clearTimeout(st.timers[name]);  // Исправлено: убран clearInterval
+    clearTimeout(st.timers[name]);
     st.timers[name] = null;
   }
 }
@@ -155,6 +162,12 @@ function clearAllTimers() {
   clearTimer("start_retry");
   clearTimer("grid_fail_debounce");
   clearTimer("manual_cooldown");
+  
+  // Остановка мониторинга заслонки
+  if (st.timers.choke_monitor) {
+    clearInterval(st.timers.choke_monitor);
+    st.timers.choke_monitor = null;
+  }
 }
 
 function setK1(on, reason) {
@@ -178,6 +191,15 @@ function setChoke(open, reason) {
   if (dev[path] !== open) {
     dev[path] = open;
     gLog("K3 (заслонка): " + (open ? "OPEN" : "CLOSED") + (reason ? " (" + reason + ")" : ""));
+    
+    // Отслеживаем время открытия
+    if (open) {
+      st.choke_opened_at = Date.now();
+      st.choke_should_be_closed = false;
+    } else {
+      st.choke_opened_at = null;
+      st.choke_should_be_closed = false;
+    }
   }
 }
 
@@ -203,7 +225,6 @@ function stopStarter(reason) {
     clearTimer("starter_release");
     gLog("K1 (стартер): OFF" + (reason ? " (" + reason + ")" : ""));
     
-    // Останавливаем счётчик попыток ручного запуска
     if (st.manual_start_in_progress) {
       st.manual_start_in_progress = false;
     }
@@ -234,7 +255,6 @@ function startStarter(allowRetry, isManual) {
     return false;
   }
 
-  // Для ручного режима: проверка cooldown
   if (isManual) {
     var now = Date.now();
     var elapsed = (now - st.last_manual_start) / 1000;
@@ -251,7 +271,6 @@ function startStarter(allowRetry, isManual) {
   dev[path] = true;
   gLog("K1 (стартер): ON");
   
-  // Статистика
   st.stats.total_starts++;
   st.stats.last_start_time = new Date().toISOString();
   updateStats();
@@ -308,7 +327,7 @@ function startEngineHoursCounter() {
       st.stats.engine_start_time = Date.now();
       updateStats();
     }
-  }, 60000); // Обновление каждую минуту
+  }, 60000);
 }
 
 function stopEngineHoursCounter() {
@@ -327,7 +346,7 @@ function stopEngineHoursCounter() {
 function cancelAutostart(reason) {
   gLog("Автозапуск отменён: " + reason);
   
-  st.canceling_autostart = true;  // ✅ Устанавливаем флаг
+  st.canceling_autostart = true;
   st.autostart_in_progress = false;
   st.warmup_in_progress = false;
   st.grid_restored_during_warmup = null;
@@ -339,10 +358,58 @@ function cancelAutostart(reason) {
   setK1(true, "возврат на посёлок после отмены");
   dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
   
-  // Сбрасываем флаг через небольшую задержку
   setTimeout(function() {
     st.canceling_autostart = false;
   }, 100);
+}
+
+// =============== КОНТРОЛЬ ЗАСЛОНКИ =============================
+function checkAndCloseChoke() {
+  var genRunning = !!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT];
+  var chokeOpen = !!dev[CFG.GEN_RELAY_DEVICE + "/" + CFG.CHOKE_RELAY];
+  
+  // Если генератор работает и заслонка открыта
+  if (genRunning && chokeOpen) {
+    var now = Date.now();
+    
+    // Проверяем время открытия
+    if (st.choke_opened_at) {
+      var openTime = (now - st.choke_opened_at) / 1000;
+      if (openTime > CFG.CHOKE_MAX_OPEN_TIME_SEC) {
+        gLog("⚠️ Заслонка открыта " + openTime.toFixed(0) + " сек → принудительное закрытие");
+        setChoke(false, "тайм-аут открытия");
+        st.choke_should_be_closed = true;
+      }
+    } else {
+      // Если не отслеживали время, но заслонка открыта - закрываем
+      gLog("⚠️ Генератор работает, заслонка открыта → закрываем");
+      setChoke(false, "генератор работает");
+      st.choke_should_be_closed = true;
+    }
+  }
+  
+  // Если генератор не работает, сбрасываем флаг
+  if (!genRunning) {
+    st.choke_should_be_closed = false;
+  }
+}
+
+function startChokeMonitor() {
+  if (st.timers.choke_monitor) return;
+  
+  st.timers.choke_monitor = setInterval(function() {
+    checkAndCloseChoke();
+  }, CFG.CHOKE_CHECK_INTERVAL_SEC * 1000);
+  
+  gLog("Мониторинг заслонки: запущен (проверка каждые " + CFG.CHOKE_CHECK_INTERVAL_SEC + " сек)");
+}
+
+function stopChokeMonitor() {
+  if (st.timers.choke_monitor) {
+    clearInterval(st.timers.choke_monitor);
+    st.timers.choke_monitor = null;
+    gLog("Мониторинг заслонки: остановлен");
+  }
 }
 
 // =============== МОНИТОРИНГ VIN И МАСЛА =======================
@@ -531,6 +598,11 @@ defineRule("gen_voltage_monitor", {
         startEngineHoursCounter();
       }
       
+      // Запуск мониторинга заслонки
+      if (!st.timers.choke_monitor) {
+        startChokeMonitor();
+      }
+      
       if (st.starter_active) {
         st.starter_release_window = true;
         clearTimer("starter_release");
@@ -543,25 +615,36 @@ defineRule("gen_voltage_monitor", {
           updateStats();
         }, CFG.START_RELEASE_DELAY_SEC * 1000);
         
+        // ГАРАНТИРОВАННОЕ закрытие заслонки после запуска
         clearTimer("choke_close");
         clearTimer("choke_close_manual");
         st.timers.choke_close = setTimeout(function () {
-          setChoke(false, "закрываем после запуска");
+          if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT]) {
+            setChoke(false, "закрываем после запуска");
+            st.choke_should_be_closed = true;
+          }
         }, (CFG.START_RELEASE_DELAY_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
       }
       
-      // ✅ ИСПРАВЛЕНО: проверяем режим AUTO и состояние сети
       if (st.autostart_in_progress) {
         startWarmupAndTransfer();
       } else if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && 
                  !dev[CFG.GEN_VDEV + "/house_on_gen"] && 
                  !st.grid_ok) {
-        // Генератор запустился вручную/внешне, но режим AUTO и сеть плохая
         gLog("Генератор работает, сеть плохая, режим AUTO → переводим дом на генератор");
-        st.autostart_in_progress = true;  // Включаем флаг
+        st.autostart_in_progress = true;
         startWarmupAndTransfer();
       } else {
         dev[CFG.GEN_VDEV + "/status"] = "Ручной запуск: генератор завёлся";
+        // Для ручного запуска тоже закрываем заслонку
+        clearTimer("choke_close");
+        clearTimer("choke_close_manual");
+        st.timers.choke_close = setTimeout(function () {
+          if (dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT]) {
+            setChoke(false, "закрываем после ручного запуска");
+            st.choke_should_be_closed = true;
+          }
+        }, CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC * 1000);
       }
     } else {
       gLog("EXT1_IN6 (напряжение генератора): OFF");
@@ -570,6 +653,9 @@ defineRule("gen_voltage_monitor", {
       
       // Остановка счётчика моточасов
       stopEngineHoursCounter();
+      
+      // Остановка мониторинга заслонки
+      stopChokeMonitor();
     }
   }
 });
@@ -583,7 +669,7 @@ function startAutostart() {
   st.return_in_progress = false;
   st.autostart_in_progress = true;
   st.warmup_in_progress = false;
-  st.attempts = 1;  // ✅ ИСПРАВЛЕНО: начинаем с попытки #1
+  st.attempts = 1;
   gLog("СЕТИ НЕТ — ЗАПУСК ГЕНЕРАТОРА (макс. " + CFG.START_ATTEMPTS_MAX + " попыток)");
   gLog("Попытка #" + st.attempts);
   setK1(false, "сеть пропала");
@@ -596,7 +682,6 @@ function handleStartFailure() {
     return;
   }
   
-  // ✅ ИСПРАВЛЕНО: увеличиваем счётчик ПЕРЕД проверкой
   st.attempts += 1;
   
   if (st.attempts > CFG.START_ATTEMPTS_MAX) {
@@ -723,18 +808,13 @@ defineRule("mode_change", {
     st.manual_start_in_progress = false;
     
     if (mode === "AUTO") {
-      // ✅ НОВАЯ ЛОГИКА: проверяем состояние сети при переключении в AUTO
       if (dev[CFG.GEN_VDEV + "/house_on_gen"]) {
-        // Уже на генераторе → запускаем периодическую проверку сети
         gLog("Дом на генераторе → запуск мониторинга сети");
         scheduleGridCheck();
       } else {
-        // Дом на посёлке → проверяем состояние сети
         var ok = updateGridState(false);
         if (!ok && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
-          // Сеть плохая → запускаем автозапуск
           gLog("Сеть вне нормы при переключении в AUTO → запуск генератора");
-          // Запускаем через debounce (защита от ложных срабатываний)
           onGridLost();
         } else if (ok) {
           gLog("Сеть в норме");
@@ -758,7 +838,6 @@ defineRule("manual_k1", {
   whenChanged: CFG.GEN_VDEV + "/manual_k1_grid",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      // Исправлено: убран лог, просто синхронизируем
       dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
       return;
     }
@@ -770,7 +849,6 @@ defineRule("manual_k4", {
   whenChanged: CFG.GEN_VDEV + "/manual_k4_gen",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      // Исправлено: убран лог
       dev[CFG.GEN_VDEV + "/manual_k4_gen"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4];
       return;
     }
@@ -796,19 +874,7 @@ defineRule("manual_start", {
     
     gLog("Ручной запуск: попытка");
     setChoke(true, "ручной запуск");
-    
-    // Исправлено: передаём флаг isManual=true
-    var started = startStarter(false, true);
-    
-    if (started) {
-      clearTimer("choke_close");
-      clearTimer("choke_close_manual");
-      st.timers.choke_close_manual = setTimeout(function () {
-        if (!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT] && !st.starter_active) {
-          setChoke(false, "закрываем после ручной попытки");
-        }
-      }, (CFG.START_SPIN_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
-    }
+    startStarter(false, true);
   }
 });
 
@@ -863,7 +929,6 @@ defineRule("stop_relay_monitor", {
 defineRule("sync_k1_real", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (value) {
-    // Исправлено: синхронизация работает всегда, без логов
     dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!value;
   }
 });
@@ -890,9 +955,8 @@ defineRule("log_choke", {
 defineRule("log_k1_external", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (val) {
-    // Логируем только если это не наша команда
     if (!st.autostart_in_progress && !st.return_in_progress && 
-        !st.canceling_autostart &&  // ✅ Проверяем новый флаг
+        !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
       gLog("⚠️ Внешнее изменение К1 (посёлок): " + (val ? "ON" : "OFF"));
     }
@@ -903,7 +967,7 @@ defineRule("log_k4_external", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4,
   then: function (val) {
     if (!st.autostart_in_progress && !st.return_in_progress && 
-        !st.canceling_autostart &&  // ✅ Проверяем новый флаг
+        !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
       gLog("⚠️ Внешнее изменение К4 (генератор): " + (val ? "ON" : "OFF"));
     }
@@ -938,6 +1002,15 @@ defineRule("gen_init", {
     gLog("К1 (посёлок): " + (k1 ? "ON" : "OFF"));
     gLog("К4 (генератор): " + (k4 ? "ON" : "OFF"));
     gLog("Сеть: " + (st.grid_ok ? "OK" : "LOST"));
+    
+    // Проверка заслонки при инициализации
+    var genRunning = !!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT];
+    if (genRunning) {
+      gLog("Генератор работает при старте → запуск мониторинга заслонки");
+      startChokeMonitor();
+      checkAndCloseChoke();
+    }
+    
     gLog("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА ===");
   }
 });
