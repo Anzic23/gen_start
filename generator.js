@@ -172,18 +172,30 @@ function clearAllTimers() {
 
 function setK1(on, reason) {
   var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1;
-  if (dev[path] !== on) {
-    dev[path] = on;
+  var hardwareState = !on; // НЗ контакт: логическое ON = аппаратное 0
+  if (dev[path] !== hardwareState) {
+    dev[path] = hardwareState;
     gLog("К1 (посёлок): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
 function setk2(on, reason) {
   var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2;
-  if (dev[path] !== on) {
-    dev[path] = on;
+  var hardwareState = !on; // НЗ контакт: логическое ON = аппаратное 0
+  if (dev[path] !== hardwareState) {
+    dev[path] = hardwareState;
     gLog("К2 (генератор): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
+}
+
+function isK1On() {
+  var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1;
+  return !dev[path];
+}
+
+function isK2On() {
+  var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2;
+  return !dev[path];
 }
 
 function setChoke(open, reason) {
@@ -838,7 +850,7 @@ defineRule("manual_k1", {
   whenChanged: CFG.GEN_VDEV + "/manual_k1_grid",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
+      dev[CFG.GEN_VDEV + "/manual_k1_grid"] = isK1On();
       return;
     }
     setK1(!!val, "ручное управление");
@@ -849,7 +861,7 @@ defineRule("manual_k2", {
   whenChanged: CFG.GEN_VDEV + "/manual_k2_gen",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      dev[CFG.GEN_VDEV + "/manual_k2_gen"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2];
+      dev[CFG.GEN_VDEV + "/manual_k2_gen"] = isK2On();
       return;
     }
     setk2(!!val, "ручное управление");
@@ -929,14 +941,14 @@ defineRule("stop_relay_monitor", {
 defineRule("sync_k1_real", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (value) {
-    dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!value;
+    dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !value;
   }
 });
 
 defineRule("sync_k2_real", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2,
   then: function (value) {
-    var on = !!value;
+    var on = !value;
     dev[CFG.GEN_VDEV + "/manual_k2_gen"] = on;
     dev[CFG.GEN_VDEV + "/house_on_gen"] = on;
   }
@@ -955,10 +967,10 @@ defineRule("log_choke", {
 defineRule("log_k1_external", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (val) {
-    if (!st.autostart_in_progress && !st.return_in_progress && 
+    if (!st.autostart_in_progress && !st.return_in_progress &&
         !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("⚠️ Внешнее изменение К1 (посёлок): " + (val ? "ON" : "OFF"));
+      gLog("⚠️ Внешнее изменение К1 (посёлок): " + (!val ? "ON" : "OFF"));
     }
   }
 });
@@ -966,10 +978,10 @@ defineRule("log_k1_external", {
 defineRule("log_k2_external", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2,
   then: function (val) {
-    if (!st.autostart_in_progress && !st.return_in_progress && 
+    if (!st.autostart_in_progress && !st.return_in_progress &&
         !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("⚠️ Внешнее изменение К2 (генератор): " + (val ? "ON" : "OFF"));
+      gLog("⚠️ Внешнее изменение К2 (генератор): " + (!val ? "ON" : "OFF"));
     }
   }
 });
@@ -983,8 +995,8 @@ defineRule("gen_init", {
     updateOilLow();
     updateGridState(true);
 
-    var k1 = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
-    var k2 = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2];
+    var k1 = isK1On();
+    var k2 = isK2On();
     dev[CFG.GEN_VDEV + "/manual_k1_grid"] = k1;
     dev[CFG.GEN_VDEV + "/manual_k2_gen"] = k2;
     dev[CFG.GEN_VDEV + "/house_on_gen"] = k2;
