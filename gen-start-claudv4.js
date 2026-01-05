@@ -1,17 +1,22 @@
 // Управление генератором и вводами (wb-rules)
-// v5.1 - Исправления заслонки:
-// - Добавлен периодический мониторинг заслонки каждые 10 сек
-// - Исправлен баг с условием закрытия заслонки в ручном режиме
-// - Гарантированное закрытие через макс. 10 сек после запуска
-// - Отслеживание времени открытия заслонки
-// - Принудительное закрытие если генератор работает
+// v5.4 - Улучшения моточасов и Telegram
+// - Исправлено: моточасы считаются при перезапуске скрипта
+// - Исправлено: логирование только при смене часа (не каждую минуту)
+// - Telegram интеграция для всех событий
+// - Детальная статистика: дни, часы, минуты
+// - Частое обновление моточасов (каждые 10 сек)
 
 // =============== КОНФИГУРАЦИЯ ==================================
 var CFG = {
   GEN_VDEV: "gen_virtual",
 
+  // Telegram оповещения
+  TELEGRAM_TOKEN: "xxxx",
+  TELEGRAM_CHAT_ID: "xxxx",
+  TELEGRAM_ENABLED: true,
+
   GEN_RELAY_DEVICE: "wb-mr6c_76",
-  CONTACTOR_DEVICE: "wb-mr6c_39",
+  CONTACTOR_DEVICE: "wb-mr3_33",
   GPIO_DEVICE: "wb-gpio",
   VIN_DEVICE: "power_status",
   VIN_CONTROL: "Vin",
@@ -24,7 +29,10 @@ var CFG = {
   CHOKE_RELAY: "K3",
 
   GRID_K1: "K1",
-  GEN_K4: "K4",
+  GEN_K2: "K2",
+
+  GRID_RELAY_INVERTED: true,
+  GEN_RELAY_INVERTED: true,
 
   GRID_METER_DEVICE: "wb-map3et_90",
   GRID_V_L1: "Urms L1",
@@ -45,19 +53,20 @@ var CFG = {
   WARMUP_GRID_STABLE_SEC: 10,
 
   RETURN_WAIT_SEC: 20,
-  K4_OFF_AFTER_RETURN_SEC: 5,
+  k2_OFF_AFTER_RETURN_SEC: 5,
   STOP_PULSE_SEC: 10,
 
   GRID_CHECK_INTERVAL_SEC: 30,
   GRID_FAIL_DEBOUNCE_SEC: 3,
 
   VIN_MIN: 11.0,
-  
+
   MANUAL_START_COOLDOWN_SEC: 2,
-  
-  // Контроль заслонки
-  CHOKE_CHECK_INTERVAL_SEC: 10,  // Проверка каждые 10 сек
-  CHOKE_MAX_OPEN_TIME_SEC: 10    // Макс. 10 сек открытия после запуска
+
+  CHOKE_CHECK_INTERVAL_SEC: 10,
+  CHOKE_MAX_OPEN_TIME_SEC: 10,
+
+  ENGINE_HOURS_UPDATE_INTERVAL_SEC: 10
 };
 
 // =============== СОСТОЯНИЕ =====================================
@@ -74,20 +83,19 @@ var st = {
   grid_fail_timestamp: null,
   grid_restored_during_warmup: null,
   last_manual_start: 0,
-  choke_opened_at: null,  // Timestamp открытия заслонки
-  choke_should_be_closed: false,  // Флаг для принудительного контроля
+  choke_opened_at: null,
+  choke_should_be_closed: false,
   canceling_autostart: false,
-  
-  // Статистика
+
   stats: {
     total_starts: 0,
     successful_starts: 0,
     failed_starts: 0,
-    engine_hours: 0,
+    engine_total_minutes: 0,
     last_start_time: null,
     engine_start_time: null
   },
-  
+
   timers: {
     starter_spin: null,
     starter_watchdog: null,
@@ -98,13 +106,13 @@ var st = {
     warmup_grid_check: null,
     return_wait: null,
     stop_pulse: null,
-    k4_off_delay: null,
+    k2_off_delay: null,
     grid_check_interval: null,
     start_retry: null,
     grid_fail_debounce: null,
     manual_cooldown: null,
     engine_hours_counter: null,
-    choke_monitor: null  // Периодическая проверка заслонки
+    choke_monitor: null
   }
 };
 
@@ -123,21 +131,35 @@ defineVirtualDevice(CFG.GEN_VDEV, {
     voltage_l2: { type: "value", readonly: true, value: 0, precision: 1 },
     voltage_l3: { type: "value", readonly: true, value: 0, precision: 1 },
     manual_k1_grid: { type: "switch", value: false },
-    manual_k4_gen: { type: "switch", value: false },
+    manual_k2_gen: { type: "switch", value: false },
     manual_start: { type: "pushbutton" },
     emergency_stop: { type: "switch", value: false },
     
-    // Статистика
+    telegram_enabled: { type: "switch", value: true },
+
     total_starts: { type: "value", readonly: true, value: 0 },
     successful_starts: { type: "value", readonly: true, value: 0 },
     failed_starts: { type: "value", readonly: true, value: 0 },
-    engine_hours: { type: "value", readonly: true, value: 0, units: "h", precision: 1 }
+    
+    engine_days: { type: "value", readonly: true, value: 0, units: "д" },
+    engine_hours: { type: "value", readonly: true, value: 0, units: "ч" },
+    engine_minutes: { type: "value", readonly: true, value: 0, units: "м" },
+    engine_total_hours: { type: "value", readonly: true, value: 0, units: "h", precision: 2 }
   }
 });
 
 // =============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
 function gLog(msg) {
-  log("Генератор: " + msg);
+  var fullMsg = "Генератор: " + msg;
+  log(fullMsg);
+  
+  if (CFG.TELEGRAM_ENABLED && dev[CFG.GEN_VDEV + "/telegram_enabled"]) {
+    try {
+      Notify.sendTelegramMessage(CFG.TELEGRAM_TOKEN, CFG.TELEGRAM_CHAT_ID, "🔌 " + fullMsg);
+    } catch (e) {
+      log("⚠️ Ошибка отправки в Telegram: " + e);
+    }
+  }
 }
 
 function clearTimer(name) {
@@ -157,32 +179,49 @@ function clearAllTimers() {
   clearTimer("warmup_grid_check");
   clearTimer("return_wait");
   clearTimer("stop_pulse");
-  clearTimer("k4_off_delay");
+  clearTimer("k2_off_delay");
   clearTimer("grid_check_interval");
   clearTimer("start_retry");
   clearTimer("grid_fail_debounce");
   clearTimer("manual_cooldown");
-  
-  // Остановка мониторинга заслонки
+
   if (st.timers.choke_monitor) {
     clearInterval(st.timers.choke_monitor);
     st.timers.choke_monitor = null;
   }
 }
 
+function readContactor(path, inverted) {
+  var v = dev[path];
+  if (typeof v === "undefined") {
+    return false;
+  }
+  var relayOn = !!v;
+  return inverted ? !relayOn : relayOn;
+}
+
+function writeContactor(path, on, inverted) {
+  var relayOn = inverted ? !on : on;
+  if (dev[path] !== relayOn) {
+    dev[path] = relayOn;
+    return true;
+  }
+  return false;
+}
+
 function setK1(on, reason) {
   var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1;
-  if (dev[path] !== on) {
-    dev[path] = on;
+  var changed = writeContactor(path, !!on, CFG.GRID_RELAY_INVERTED);
+  if (changed) {
     gLog("К1 (посёлок): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
-function setK4(on, reason) {
-  var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4;
-  if (dev[path] !== on) {
-    dev[path] = on;
-    gLog("К4 (генератор): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
+function setk2(on, reason) {
+  var path = CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2;
+  var changed = writeContactor(path, !!on, CFG.GEN_RELAY_INVERTED);
+  if (changed) {
+    gLog("К2 (генератор): " + (on ? "ON" : "OFF") + (reason ? " (" + reason + ")" : ""));
   }
 }
 
@@ -191,8 +230,7 @@ function setChoke(open, reason) {
   if (dev[path] !== open) {
     dev[path] = open;
     gLog("K3 (заслонка): " + (open ? "OPEN" : "CLOSED") + (reason ? " (" + reason + ")" : ""));
-    
-    // Отслеживаем время открытия
+
     if (open) {
       st.choke_opened_at = Date.now();
       st.choke_should_be_closed = false;
@@ -224,7 +262,7 @@ function stopStarter(reason) {
     clearTimer("starter_watchdog");
     clearTimer("starter_release");
     gLog("K1 (стартер): OFF" + (reason ? " (" + reason + ")" : ""));
-    
+
     if (st.manual_start_in_progress) {
       st.manual_start_in_progress = false;
     }
@@ -233,7 +271,7 @@ function stopStarter(reason) {
 
 function startStarter(allowRetry, isManual) {
   var path = CFG.GEN_RELAY_DEVICE + "/" + CFG.STARTER_RELAY;
-  
+
   if (st.starter_active) {
     gLog("⚠️ Стартер уже активен, включение игнорируется");
     return false;
@@ -270,7 +308,7 @@ function startStarter(allowRetry, isManual) {
   st.starter_release_window = false;
   dev[path] = true;
   gLog("K1 (стартер): ON");
-  
+
   st.stats.total_starts++;
   st.stats.last_start_time = new Date().toISOString();
   updateStats();
@@ -308,26 +346,52 @@ function startStarter(allowRetry, isManual) {
   return true;
 }
 
-// Статистика
+// =============== СТАТИСТИКА И МОТОЧАСЫ =========================
 function updateStats() {
   dev[CFG.GEN_VDEV + "/total_starts"] = st.stats.total_starts;
   dev[CFG.GEN_VDEV + "/successful_starts"] = st.stats.successful_starts;
   dev[CFG.GEN_VDEV + "/failed_starts"] = st.stats.failed_starts;
-  dev[CFG.GEN_VDEV + "/engine_hours"] = st.stats.engine_hours;
+  
+  var totalMinutes = st.stats.engine_total_minutes;
+  var days = Math.floor(totalMinutes / 1440);
+  var hours = Math.floor((totalMinutes % 1440) / 60);
+  var minutes = Math.floor(totalMinutes % 60);
+  
+  dev[CFG.GEN_VDEV + "/engine_days"] = days;
+  dev[CFG.GEN_VDEV + "/engine_hours"] = hours;
+  dev[CFG.GEN_VDEV + "/engine_minutes"] = minutes;
+  dev[CFG.GEN_VDEV + "/engine_total_hours"] = totalMinutes / 60;
 }
 
 function startEngineHoursCounter() {
-  if (st.timers.engine_hours_counter) return;
-  
+  if (st.timers.engine_hours_counter) {
+    gLog("⚠️ Счетчик моточасов уже запущен");
+    return;
+  }
+
   st.stats.engine_start_time = Date.now();
+  gLog("✓ Счетчик моточасов: ЗАПУЩЕН (обновление каждые " + CFG.ENGINE_HOURS_UPDATE_INTERVAL_SEC + " сек)");
+  
+  var lastLoggedHour = dev[CFG.GEN_VDEV + "/engine_hours"];
+  
   st.timers.engine_hours_counter = setInterval(function() {
     if (st.stats.engine_start_time) {
-      var elapsed = (Date.now() - st.stats.engine_start_time) / 1000 / 3600;
-      st.stats.engine_hours += elapsed;
-      st.stats.engine_start_time = Date.now();
+      var now = Date.now();
+      var elapsed_minutes = (now - st.stats.engine_start_time) / 1000 / 60;
+      st.stats.engine_total_minutes += elapsed_minutes;
+      st.stats.engine_start_time = now;
+      
       updateStats();
+      
+      var currentHour = dev[CFG.GEN_VDEV + "/engine_hours"];
+      if (currentHour !== lastLoggedHour) {
+        gLog("Моточасы: " + dev[CFG.GEN_VDEV + "/engine_days"] + "д " + 
+             currentHour + "ч " + 
+             dev[CFG.GEN_VDEV + "/engine_minutes"] + "м");
+        lastLoggedHour = currentHour;
+      }
     }
-  }, 60000);
+  }, CFG.ENGINE_HOURS_UPDATE_INTERVAL_SEC * 1000);
 }
 
 function stopEngineHoursCounter() {
@@ -335,17 +399,26 @@ function stopEngineHoursCounter() {
     clearInterval(st.timers.engine_hours_counter);
     st.timers.engine_hours_counter = null;
   }
+  
   if (st.stats.engine_start_time) {
-    var elapsed = (Date.now() - st.stats.engine_start_time) / 1000 / 3600;
-    st.stats.engine_hours += elapsed;
+    var now = Date.now();
+    var elapsed_minutes = (now - st.stats.engine_start_time) / 1000 / 60;
+    st.stats.engine_total_minutes += elapsed_minutes;
     st.stats.engine_start_time = null;
+    
     updateStats();
+    
+    gLog("✓ Счетчик моточасов: ОСТАНОВЛЕН. Итого: " + 
+         dev[CFG.GEN_VDEV + "/engine_days"] + "д " + 
+         dev[CFG.GEN_VDEV + "/engine_hours"] + "ч " + 
+         dev[CFG.GEN_VDEV + "/engine_minutes"] + "м (" + 
+         dev[CFG.GEN_VDEV + "/engine_total_hours"].toFixed(2) + "ч)");
   }
 }
 
 function cancelAutostart(reason) {
   gLog("Автозапуск отменён: " + reason);
-  
+
   st.canceling_autostart = true;
   st.autostart_in_progress = false;
   st.warmup_in_progress = false;
@@ -357,7 +430,7 @@ function cancelAutostart(reason) {
   clearTimer("start_retry");
   setK1(true, "возврат на посёлок после отмены");
   dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
-  
+
   setTimeout(function() {
     st.canceling_autostart = false;
   }, 100);
@@ -367,12 +440,10 @@ function cancelAutostart(reason) {
 function checkAndCloseChoke() {
   var genRunning = !!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT];
   var chokeOpen = !!dev[CFG.GEN_RELAY_DEVICE + "/" + CFG.CHOKE_RELAY];
-  
-  // Если генератор работает и заслонка открыта
+
   if (genRunning && chokeOpen) {
     var now = Date.now();
-    
-    // Проверяем время открытия
+
     if (st.choke_opened_at) {
       var openTime = (now - st.choke_opened_at) / 1000;
       if (openTime > CFG.CHOKE_MAX_OPEN_TIME_SEC) {
@@ -381,14 +452,12 @@ function checkAndCloseChoke() {
         st.choke_should_be_closed = true;
       }
     } else {
-      // Если не отслеживали время, но заслонка открыта - закрываем
       gLog("⚠️ Генератор работает, заслонка открыта → закрываем");
       setChoke(false, "генератор работает");
       st.choke_should_be_closed = true;
     }
   }
-  
-  // Если генератор не работает, сбрасываем флаг
+
   if (!genRunning) {
     st.choke_should_be_closed = false;
   }
@@ -396,11 +465,11 @@ function checkAndCloseChoke() {
 
 function startChokeMonitor() {
   if (st.timers.choke_monitor) return;
-  
+
   st.timers.choke_monitor = setInterval(function() {
     checkAndCloseChoke();
   }, CFG.CHOKE_CHECK_INTERVAL_SEC * 1000);
-  
+
   gLog("Мониторинг заслонки: запущен (проверка каждые " + CFG.CHOKE_CHECK_INTERVAL_SEC + " сек)");
 }
 
@@ -484,10 +553,10 @@ function updateGridState(fromInit) {
 function onGridLost() {
   gLog("Сеть: LOST (" + getVoltageString() + ")");
   dev[CFG.GEN_VDEV + "/status"] = "СЕТИ НЕТ — ЗАПУСК ГЕНЕРАТОРА";
-  
+
   st.grid_restored_during_warmup = null;
   clearTimer("warmup_grid_check");
-  
+
   if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
     gLog("Debounce " + CFG.GRID_FAIL_DEBOUNCE_SEC + " сек");
     clearTimer("grid_fail_debounce");
@@ -510,19 +579,19 @@ function onGridLost() {
 
 function onGridRestored() {
   gLog("Сеть: OK (" + getVoltageString() + ")");
-  
+
   if (st.grid_fail_timestamp) {
     clearTimer("grid_fail_debounce");
     st.grid_fail_timestamp = null;
     gLog("Debounce отменён");
   }
-  
+
   if (st.autostart_in_progress) {
     if (st.warmup_in_progress) {
       if (!st.grid_restored_during_warmup) {
         st.grid_restored_during_warmup = Date.now();
         gLog("Сеть восстановилась во время прогрева, проверка " + CFG.WARMUP_GRID_STABLE_SEC + " сек");
-        
+
         clearTimer("warmup_grid_check");
         st.timers.warmup_grid_check = setTimeout(function() {
           var ok = updateGridState(false);
@@ -543,13 +612,13 @@ function onGridRestored() {
     }
     return;
   }
-  
+
   if (!dev[CFG.GEN_VDEV + "/house_on_gen"]) {
     dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
     setK1(true, "сеть восстановилась");
     return;
   }
-  
+
   if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && !dev[CFG.GEN_VDEV + "/emergency_stop"]) {
     startReturnProcedure();
   } else {
@@ -592,30 +661,26 @@ defineRule("gen_voltage_monitor", {
     st.generator_voltage = !!value;
     if (value) {
       gLog("EXT1_IN6 (напряжение генератора): ON");
-      
-      // Запуск счётчика моточасов
+
       if (!st.timers.engine_hours_counter) {
         startEngineHoursCounter();
       }
-      
-      // Запуск мониторинга заслонки
+
       if (!st.timers.choke_monitor) {
         startChokeMonitor();
       }
-      
+
       if (st.starter_active) {
         st.starter_release_window = true;
         clearTimer("starter_release");
         st.timers.starter_release = setTimeout(function () {
           st.starter_release_window = false;
           stopStarter("генератор завёлся");
-          
-          // Статистика успешного запуска
+
           st.stats.successful_starts++;
           updateStats();
         }, CFG.START_RELEASE_DELAY_SEC * 1000);
-        
-        // ГАРАНТИРОВАННОЕ закрытие заслонки после запуска
+
         clearTimer("choke_close");
         clearTimer("choke_close_manual");
         st.timers.choke_close = setTimeout(function () {
@@ -625,18 +690,17 @@ defineRule("gen_voltage_monitor", {
           }
         }, (CFG.START_RELEASE_DELAY_SEC + CFG.CHOKE_CLOSE_AFTER_RELEASE_SEC) * 1000);
       }
-      
+
       if (st.autostart_in_progress) {
         startWarmupAndTransfer();
-      } else if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" && 
-                 !dev[CFG.GEN_VDEV + "/house_on_gen"] && 
+      } else if (dev[CFG.GEN_VDEV + "/mode"] === "AUTO" &&
+                 !dev[CFG.GEN_VDEV + "/house_on_gen"] &&
                  !st.grid_ok) {
         gLog("Генератор работает, сеть плохая, режим AUTO → переводим дом на генератор");
         st.autostart_in_progress = true;
         startWarmupAndTransfer();
       } else {
         dev[CFG.GEN_VDEV + "/status"] = "Ручной запуск: генератор завёлся";
-        // Для ручного запуска тоже закрываем заслонку
         clearTimer("choke_close");
         clearTimer("choke_close_manual");
         st.timers.choke_close = setTimeout(function () {
@@ -650,11 +714,8 @@ defineRule("gen_voltage_monitor", {
       gLog("EXT1_IN6 (напряжение генератора): OFF");
       st.generator_voltage = false;
       setChoke(false, "генератор не даёт напряжение");
-      
-      // Остановка счётчика моточасов
+
       stopEngineHoursCounter();
-      
-      // Остановка мониторинга заслонки
       stopChokeMonitor();
     }
   }
@@ -681,9 +742,9 @@ function handleStartFailure() {
   if (!st.autostart_in_progress) {
     return;
   }
-  
+
   st.attempts += 1;
-  
+
   if (st.attempts > CFG.START_ATTEMPTS_MAX) {
     gLog("❌ Генератор не запущен после " + CFG.START_ATTEMPTS_MAX + " попыток");
     dev[CFG.GEN_VDEV + "/status"] = "Ошибка запуска";
@@ -693,7 +754,7 @@ function handleStartFailure() {
     updateStats();
     return;
   }
-  
+
   gLog("Пауза " + CFG.START_REST_SEC + " сек перед попыткой #" + st.attempts);
   clearTimer("starter_spin");
   clearTimer("starter_watchdog");
@@ -737,7 +798,7 @@ function startWarmupAndTransfer() {
       }
       return;
     }
-    setK4(true, "дом на генераторе");
+    setk2(true, "дом на генераторе");
     setK1(false, "переход на генератор");
     dev[CFG.GEN_VDEV + "/house_on_gen"] = true;
     dev[CFG.GEN_VDEV + "/status"] = "Дом на генераторе";
@@ -783,12 +844,12 @@ function performReturnSwitch() {
     setStopRelay(false, "завершение глушения");
   }, CFG.STOP_PULSE_SEC * 1000);
 
-  clearTimer("k4_off_delay");
-  st.timers.k4_off_delay = setTimeout(function () {
-    setK4(false, "отключение генератора после возврата");
+  clearTimer("k2_off_delay");
+  st.timers.k2_off_delay = setTimeout(function () {
+    setk2(false, "отключение генератора после возврата");
     dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
     st.return_in_progress = false;
-  }, CFG.K4_OFF_AFTER_RETURN_SEC * 1000);
+  }, CFG.k2_OFF_AFTER_RETURN_SEC * 1000);
 }
 
 // =============== РЕЖИМЫ И РУЧНОЙ РЕЖИМ ========================
@@ -806,7 +867,7 @@ defineRule("mode_change", {
     st.grid_fail_timestamp = null;
     st.grid_restored_during_warmup = null;
     st.manual_start_in_progress = false;
-    
+
     if (mode === "AUTO") {
       if (dev[CFG.GEN_VDEV + "/house_on_gen"]) {
         gLog("Дом на генераторе → запуск мониторинга сети");
@@ -838,21 +899,21 @@ defineRule("manual_k1", {
   whenChanged: CFG.GEN_VDEV + "/manual_k1_grid",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
+      dev[CFG.GEN_VDEV + "/manual_k1_grid"] = readContactor(CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1, CFG.GRID_RELAY_INVERTED);
       return;
     }
     setK1(!!val, "ручное управление");
   }
 });
 
-defineRule("manual_k4", {
-  whenChanged: CFG.GEN_VDEV + "/manual_k4_gen",
+defineRule("manual_k2", {
+  whenChanged: CFG.GEN_VDEV + "/manual_k2_gen",
   then: function (val) {
     if (dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      dev[CFG.GEN_VDEV + "/manual_k4_gen"] = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4];
+      dev[CFG.GEN_VDEV + "/manual_k2_gen"] = readContactor(CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2, CFG.GEN_RELAY_INVERTED);
       return;
     }
-    setK4(!!val, "ручное управление");
+    setk2(!!val, "ручное управление");
   }
 });
 
@@ -871,7 +932,7 @@ defineRule("manual_start", {
       gLog("⚠️ Ручной запуск заблокирован: низкий уровень масла");
       return;
     }
-    
+
     gLog("Ручной запуск: попытка");
     setChoke(true, "ручной запуск");
     startStarter(false, true);
@@ -905,6 +966,18 @@ defineRule("emergency_stop", {
   }
 });
 
+// =============== TELEGRAM УПРАВЛЕНИЕ ===========================
+defineRule("telegram_toggle", {
+  whenChanged: CFG.GEN_VDEV + "/telegram_enabled",
+  then: function (val) {
+    if (val) {
+      gLog("📱 Telegram уведомления: ВКЛЮЧЕНЫ");
+    } else {
+      log("Генератор: 📱 Telegram уведомления: ВЫКЛЮЧЕНЫ");
+    }
+  }
+});
+
 // =============== ОТСЛЕЖИВАНИЕ ВНЕШНИХ ВКЛЮЧЕНИЙ ===============
 defineRule("starter_external", {
   whenChanged: CFG.GEN_RELAY_DEVICE + "/" + CFG.STARTER_RELAY,
@@ -929,15 +1002,18 @@ defineRule("stop_relay_monitor", {
 defineRule("sync_k1_real", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (value) {
-    dev[CFG.GEN_VDEV + "/manual_k1_grid"] = !!value;
+    var relayOn = !!value;
+    var on = CFG.GRID_RELAY_INVERTED ? !relayOn : relayOn;
+    dev[CFG.GEN_VDEV + "/manual_k1_grid"] = on;
   }
 });
 
-defineRule("sync_k4_real", {
-  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4,
+defineRule("sync_k2_real", {
+  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2,
   then: function (value) {
-    var on = !!value;
-    dev[CFG.GEN_VDEV + "/manual_k4_gen"] = on;
+    var relayOn = !!value;
+    var on = CFG.GEN_RELAY_INVERTED ? !relayOn : relayOn;
+    dev[CFG.GEN_VDEV + "/manual_k2_gen"] = on;
     dev[CFG.GEN_VDEV + "/house_on_gen"] = on;
   }
 });
@@ -955,21 +1031,25 @@ defineRule("log_choke", {
 defineRule("log_k1_external", {
   whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1,
   then: function (val) {
-    if (!st.autostart_in_progress && !st.return_in_progress && 
+    if (!st.autostart_in_progress && !st.return_in_progress &&
         !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("⚠️ Внешнее изменение К1 (посёлок): " + (val ? "ON" : "OFF"));
+      var relayOn = !!val;
+      var on = CFG.GRID_RELAY_INVERTED ? !relayOn : relayOn;
+      gLog("⚠️ Внешнее изменение К1 (посёлок): " + (on ? "ON" : "OFF"));
     }
   }
 });
 
-defineRule("log_k4_external", {
-  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4,
+defineRule("log_k2_external", {
+  whenChanged: CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2,
   then: function (val) {
-    if (!st.autostart_in_progress && !st.return_in_progress && 
+    if (!st.autostart_in_progress && !st.return_in_progress &&
         !st.canceling_autostart &&
         dev[CFG.GEN_VDEV + "/mode"] !== "MANUAL") {
-      gLog("⚠️ Внешнее изменение К4 (генератор): " + (val ? "ON" : "OFF"));
+      var relayOn = !!val;
+      var on = CFG.GEN_RELAY_INVERTED ? !relayOn : relayOn;
+      gLog("⚠️ Внешнее изменение К2 (генератор): " + (on ? "ON" : "OFF"));
     }
   }
 });
@@ -983,15 +1063,15 @@ defineRule("gen_init", {
     updateOilLow();
     updateGridState(true);
 
-    var k1 = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1];
-    var k4 = !!dev[CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K4];
+    var k1 = readContactor(CFG.CONTACTOR_DEVICE + "/" + CFG.GRID_K1, CFG.GRID_RELAY_INVERTED);
+    var k2 = readContactor(CFG.CONTACTOR_DEVICE + "/" + CFG.GEN_K2, CFG.GEN_RELAY_INVERTED);
     dev[CFG.GEN_VDEV + "/manual_k1_grid"] = k1;
-    dev[CFG.GEN_VDEV + "/manual_k4_gen"] = k4;
-    dev[CFG.GEN_VDEV + "/house_on_gen"] = k4;
+    dev[CFG.GEN_VDEV + "/manual_k2_gen"] = k2;
+    dev[CFG.GEN_VDEV + "/house_on_gen"] = k2;
 
     if (st.grid_ok) {
       setK1(true, "инициализация, сеть в норме");
-      setK4(false, "инициализация, сеть в норме");
+      setk2(false, "инициализация, сеть в норме");
       dev[CFG.GEN_VDEV + "/house_on_gen"] = false;
       dev[CFG.GEN_VDEV + "/status"] = "Дом на посёлке";
     } else {
@@ -1000,17 +1080,21 @@ defineRule("gen_init", {
 
     gLog("Режим: " + dev[CFG.GEN_VDEV + "/mode"]);
     gLog("К1 (посёлок): " + (k1 ? "ON" : "OFF"));
-    gLog("К4 (генератор): " + (k4 ? "ON" : "OFF"));
+    gLog("К2 (генератор): " + (k2 ? "ON" : "OFF"));
     gLog("Сеть: " + (st.grid_ok ? "OK" : "LOST"));
-    
-    // Проверка заслонки при инициализации
+
     var genRunning = !!dev[CFG.GPIO_DEVICE + "/" + CFG.GEN_VOLTAGE_INPUT];
     if (genRunning) {
-      gLog("Генератор работает при старте → запуск мониторинга заслонки");
+      gLog("Генератор работает при старте → запуск мониторинга");
       startChokeMonitor();
       checkAndCloseChoke();
+      startEngineHoursCounter();
     }
-    
+
     gLog("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА ===");
+    
+    if (CFG.TELEGRAM_ENABLED && dev[CFG.GEN_VDEV + "/telegram_enabled"]) {
+      gLog("📱 Telegram уведомления активны");
+    }
   }
 });
